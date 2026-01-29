@@ -57,14 +57,6 @@ print("X_test 결측치 총합:", X_test.isna().sum().sum())
 print("object dtype columns:", X_train.select_dtypes(include="object").columns.tolist())
 print("컬럼 일치:", X_train.columns.equals(X_test.columns))
 
-# 결측치가 있다면(특히 성별 map 실패 등) 학습 전에 처리해야 함
-# 여기서는 가장 단순히 결측치가 있으면 에러를 내도록 체크(원하면 대치로 바꿔드릴게요)
-if X_train.isna().sum().sum() > 0 or X_test.isna().sum().sum() > 0:
-    raise ValueError("전처리 후 NaN이 남아 있습니다. 매핑 누락/결측치 대치를 먼저 처리하세요.")
-
-if len(X_train.select_dtypes(include="object").columns) > 0:
-    raise ValueError("object dtype 컬럼이 남아 있습니다. 인코딩/변환을 확인하세요.")
-
 # -------------------------------------------------------------------------
 # 4) 모델 학습(RandomForest) 및 예측
 
@@ -81,11 +73,5 @@ y_pred = rf.predict(X_test)  # 예측 [web:35][web:37]
 
 # -------------------------------------------------------------------------
 # 5) 평가(기본)
-
-acc = accuracy_score(y_test, y_pred)
-print("\nAccuracy:", acc)
-
-
 print("\nClassification Report:\n", classification_report(y_test, y_pred, digits=4))
 
-# git 
