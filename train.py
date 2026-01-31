@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import train_test_split, KFold
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import f1_score, classification_report
 
@@ -22,7 +22,7 @@ train_df, test_df = train_test_split(
 
 
 # -------------------------------------------------------------------------
-# 2) 전처리를 "훈련 폴드에만 fit"해서 적용하기 위한 함수
+# 2) 전처리: "훈련 폴드에만 fit"해서 적용하기 위한 함수
 def preprocess_train_valid(X_tr: pd.DataFrame, X_va: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     X_tr = X_tr.copy()
     X_va = X_va.copy()
@@ -46,7 +46,7 @@ def preprocess_train_valid(X_tr: pd.DataFrame, X_va: pd.DataFrame) -> tuple[pd.D
     X_va = pd.get_dummies(X_va, columns=["흡연 경험"], prefix="흡연")
     X_va = X_va.reindex(columns=X_tr.columns, fill_value=0)
 
-    # (권장) 전처리 후 안전 점검
+    # 전처리 누수 방지 관점에서: fit은 train에만, valid/test는 transform만 해야 함(여기선 그 원칙을 수동 구현) [web:102]
     if X_tr.isna().sum().sum() > 0 or X_va.isna().sum().sum() > 0:
         raise ValueError("전처리 후 결측치가 발생했습니다. (예: 성별/흡연 값 매핑 실패)")
 
@@ -54,19 +54,20 @@ def preprocess_train_valid(X_tr: pd.DataFrame, X_va: pd.DataFrame) -> tuple[pd.D
 
 
 # -------------------------------------------------------------------------
-# 3) 기본 KFold 교차 검증(훈련 데이터 내부에서만) - 성능지표: macro F1
+# 3) StratifiedKFold 교차 검증(훈련 데이터 내부에서만) - 성능지표: macro F1
 X_all = train_df.drop("당뇨병 여부", axis=1).copy()
 y_all = train_df["당뇨병 여부"].copy()
 
-kf = KFold(n_splits=5, shuffle=True, random_state=42)  # KFold 옵션 [web:96]
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)  # StratifiedKFold 옵션 [web:97]
 
 cv_scores = []
-for fold, (tr_idx, va_idx) in enumerate(kf.split(X_all), start=1):
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_all, y_all), start=1):  # y를 함께 전달 [web:97]
     X_tr_raw = X_all.iloc[tr_idx]
     y_tr = y_all.iloc[tr_idx]
     X_va_raw = X_all.iloc[va_idx]
     y_va = y_all.iloc[va_idx]
 
+    # 폴드별 전처리(훈련 폴드 기준으로만 기준 산출)
     X_tr, X_va = preprocess_train_valid(X_tr_raw, X_va_raw)
 
     rf = RandomForestClassifier(
@@ -78,12 +79,12 @@ for fold, (tr_idx, va_idx) in enumerate(kf.split(X_all), start=1):
     rf.fit(X_tr, y_tr)
 
     y_va_pred = rf.predict(X_va)
-    f1_macro = f1_score(y_va, y_va_pred, average="macro")  # macro F1 정의 [web:109]
+    f1_macro = f1_score(y_va, y_va_pred, average="macro")  # macro F1 [web:109]
     cv_scores.append(f1_macro)
 
     print(f"[Fold {fold}] valid_size={len(va_idx)}, macro_f1={f1_macro:.4f}")
 
-print("\n[KFold CV 결과 - macro F1]")
+print("\n[StratifiedKFold CV 결과 - macro F1]")
 print(f"macro_f1_mean={np.mean(cv_scores):.4f}, macro_f1_std={np.std(cv_scores):.4f}")
 
 
@@ -107,5 +108,5 @@ rf_final.fit(X_train, y_train)
 
 y_test_pred = rf_final.predict(X_test)
 
-print("\n[Hold-out Test Classification Report]\n", classification_report(y_test, y_test_pred, digits=4))  # 리포트에 macro avg 포함 [web:118]
-print("[Hold-out Test macro F1]", f1_score(y_test, y_test_pred, average="macro"))  # macro F1 계산 [web:109]
+print("\n[Hold-out Test Classification Report]\n", classification_report(y_test, y_test_pred, digits=4))  # macro avg 포함 [web:118]
+print("[Hold-out Test macro F1]", f1_score(y_test, y_test_pred, average="macro"))  # macro F1 [web:109]
