@@ -1,112 +1,135 @@
 import pandas as pd
 import numpy as np
 
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.base import BaseEstimator, TransformerMixin
+
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import f1_score, classification_report
 
 
-# 데이터 로드
+# -----------------------------
+# 0) 데이터 로드
 df = pd.read_csv("diabetes_prediction_dataset.csv", encoding="cp949")
-
-# (선택) 기본 확인/EDA
 df.info()
 print(df.describe())
 
 
-# -------------------------------------------------------------------------
-# 1) 데이터 분할(8:2) - 전처리(특히 통계치 계산/규칙 학습) 전에 먼저 수행
+# -----------------------------
+# 1) Hold-out split (8:2)
 train_df, test_df = train_test_split(
     df, test_size=0.2, random_state=42, stratify=df["당뇨병 여부"]
 )
 
-
-# -------------------------------------------------------------------------
-# 2) 전처리: "훈련 폴드에만 fit"해서 적용하기 위한 함수
-def preprocess_train_valid(X_tr: pd.DataFrame, X_va: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    X_tr = X_tr.copy()
-    X_va = X_va.copy()
-
-    # (A) BMI 이상치 처리: train(fold)에서 상한선 계산 → train/valid에 동일 적용
-    Q1 = X_tr["BMI 지수"].quantile(0.25)
-    Q3 = X_tr["BMI 지수"].quantile(0.75)
-    IQR = Q3 - Q1
-    upper_limit = Q3 + 1.5 * IQR
-
-    X_tr["BMI 지수"] = X_tr["BMI 지수"].clip(upper=upper_limit)
-    X_va["BMI 지수"] = X_va["BMI 지수"].clip(upper=upper_limit)
-
-    # (B) 범주형 인코딩
-    gender_map = {"Female": 0, "Male": 1, "Other": 2}
-    X_tr["성별"] = X_tr["성별"].map(gender_map)
-    X_va["성별"] = X_va["성별"].map(gender_map)
-
-    # 흡연 경험: 원-핫 인코딩 후, train 컬럼 기준으로 valid 컬럼 정렬/보정
-    X_tr = pd.get_dummies(X_tr, columns=["흡연 경험"], prefix="흡연")
-    X_va = pd.get_dummies(X_va, columns=["흡연 경험"], prefix="흡연")
-    X_va = X_va.reindex(columns=X_tr.columns, fill_value=0)
-
-    # 전처리 누수 방지 관점에서: fit은 train에만, valid/test는 transform만 해야 함(여기선 그 원칙을 수동 구현) [web:102]
-    if X_tr.isna().sum().sum() > 0 or X_va.isna().sum().sum() > 0:
-        raise ValueError("전처리 후 결측치가 발생했습니다. (예: 성별/흡연 값 매핑 실패)")
-
-    return X_tr, X_va
+target_col = "당뇨병 여부"
+X_train_raw = train_df.drop(target_col, axis=1).copy()
+y_train = train_df[target_col].copy()
+X_test_raw = test_df.drop(target_col, axis=1).copy()
+y_test = test_df[target_col].copy()
 
 
-# -------------------------------------------------------------------------
-# 3) StratifiedKFold 교차 검증(훈련 데이터 내부에서만) - 성능지표: macro F1
-X_all = train_df.drop("당뇨병 여부", axis=1).copy()
-y_all = train_df["당뇨병 여부"].copy()
+# -----------------------------
+# 2) 전처리(폴드별 fit/transform)
 
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)  # StratifiedKFold 옵션 [web:97]
+class BMIClipper(BaseEstimator, TransformerMixin):
+    # 목적: BMI 이상치 상한 clip (상한은 fold의 train에서만 계산 → 누수 방지)
+    def __init__(self, bmi_index: int):
+        self.bmi_index = bmi_index
 
-cv_scores = []
-for fold, (tr_idx, va_idx) in enumerate(skf.split(X_all, y_all), start=1):  # y를 함께 전달 [web:97]
-    X_tr_raw = X_all.iloc[tr_idx]
-    y_tr = y_all.iloc[tr_idx]
-    X_va_raw = X_all.iloc[va_idx]
-    y_va = y_all.iloc[va_idx]
+    def fit(self, X, y=None):
+        X = np.asarray(X)
+        bmi = X[:, self.bmi_index].astype(float)
+        q1 = np.quantile(bmi, 0.25)
+        q3 = np.quantile(bmi, 0.75)
+        iqr = q3 - q1
+        self.upper_limit_ = q3 + 1.5 * iqr
+        return self
 
-    # 폴드별 전처리(훈련 폴드 기준으로만 기준 산출)
-    X_tr, X_va = preprocess_train_valid(X_tr_raw, X_va_raw)
-
-    rf = RandomForestClassifier(
-        n_estimators=300,
-        random_state=42,
-        n_jobs=-1,
-        class_weight="balanced"
-    )
-    rf.fit(X_tr, y_tr)
-
-    y_va_pred = rf.predict(X_va)
-    f1_macro = f1_score(y_va, y_va_pred, average="macro")  # macro F1 [web:109]
-    cv_scores.append(f1_macro)
-
-    print(f"[Fold {fold}] valid_size={len(va_idx)}, macro_f1={f1_macro:.4f}")
-
-print("\n[StratifiedKFold CV 결과 - macro F1]")
-print(f"macro_f1_mean={np.mean(cv_scores):.4f}, macro_f1_std={np.std(cv_scores):.4f}")
+    def transform(self, X):
+        X = np.asarray(X).copy()
+        bmi = X[:, self.bmi_index].astype(float)
+        X[:, self.bmi_index] = np.minimum(bmi, self.upper_limit_)
+        return X
 
 
-# -------------------------------------------------------------------------
-# 4) 홀드아웃 테스트 평가: train_df로 fit, test_df로 최종 점검
-X_train_raw = train_df.drop("당뇨병 여부", axis=1).copy()
-y_train = train_df["당뇨병 여부"].copy()
+cat_cols = ["성별", "흡연 경험"]
+num_cols = ["나이", "고혈압 여부", "심장질환 여부", "BMI 지수", "당화혈색소 수치", "혈당 수치"]
+bmi_idx_in_num = num_cols.index("BMI 지수")
 
-X_test_raw = test_df.drop("당뇨병 여부", axis=1).copy()
-y_test = test_df["당뇨병 여부"].copy()
+numeric_pipe = Pipeline(steps=[
+    ("bmi_clip", BMIClipper(bmi_index=bmi_idx_in_num)),
+])
 
-X_train, X_test = preprocess_train_valid(X_train_raw, X_test_raw)
-
-rf_final = RandomForestClassifier(
-    n_estimators=300,
-    random_state=42,
-    n_jobs=-1,
-    class_weight="balanced"
+preprocess = ColumnTransformer(
+    transformers=[
+        ("num", numeric_pipe, num_cols),
+        ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols),
+    ],
+    remainder="drop"
 )
-rf_final.fit(X_train, y_train)
 
-y_test_pred = rf_final.predict(X_test)
 
-print("\n[Hold-out Test Classification Report]\n", classification_report(y_test, y_test_pred, digits=4))  # macro avg 포함 [web:118]
-print("[Hold-out Test macro F1]", f1_score(y_test, y_test_pred, average="macro"))  # macro F1 [web:109]
+# -----------------------------
+# 3) 모델 + GridSearchCV (cv=5 고정, CPU 친화 설정)
+
+# 중첩 병렬 방지:
+# - GridSearchCV가 병렬로 여러 조합/폴드를 돌릴 수 있으니(n_jobs),
+# - RandomForest 내부 병렬(n_jobs)은 1로 둬서 “과도한 스레드 폭발”을 막는다. [web:81][web:289]
+pipe = Pipeline(steps=[
+    ("preprocess", preprocess),
+    ("model", RandomForestClassifier(
+        random_state=42,
+        n_jobs=1,              # 중요: RF 내부 병렬 OFF (중첩 병렬 방지)
+        bootstrap=True
+    ))
+])
+
+# 속도 최우선: 영향 큰 파라미터만 “소수 후보”로 제한
+param_grid = {
+    # n_estimators: 트리 개수(시간에 가장 큰 영향). 너무 넓게 잡으면 바로 폭발하니 3개만. [web:235]
+    "model__n_estimators": [120, 200, 300],
+
+    # max_depth: 과적합/표현력 조절. None 포함 + 얕은 값 1개만 추가(2개만). 
+    "model__max_depth": [None, 12],
+
+    # min_samples_leaf: 일반화에 자주 영향. 후보 2개만.
+    "model__min_samples_leaf": [1, 5],
+
+    # class_weight: 불균형 보정 여부만 비교(2개만).
+    "model__class_weight": [None, "balanced"],
+
+    # max_features: 이 데이터는 피처 수가 많지 않아서 'sqrt' 고정해 조합 수를 줄임(속도 목적).
+    "model__max_features": ["sqrt"],
+}
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)  # cv=5 고정 [web:97]
+
+grid = GridSearchCV(
+    estimator=pipe,
+    param_grid=param_grid,
+    scoring="f1_macro",
+    cv=cv,
+    n_jobs=-1,          # GridSearch 쪽만 병렬 사용
+    pre_dispatch=2,     # 동시에 띄우는 작업 수 제한(메모리/멈춤 완화에 도움될 수 있음) [web:294]
+    verbose=2,
+    refit=True,
+    return_train_score=False
+)
+
+grid.fit(X_train_raw, y_train)
+
+print("\n[GridSearchCV Best]")
+print("best_params_:", grid.best_params_)
+print(f"best_cv_macro_f1: {grid.best_score_:.4f}")
+
+
+# -----------------------------
+# 4) Hold-out test 평가
+best_model = grid.best_estimator_
+y_test_pred = best_model.predict(X_test_raw)
+
+print("\n[Hold-out Test Classification Report]\n", classification_report(y_test, y_test_pred, digits=4))
+print("[Hold-out Test macro F1]", f1_score(y_test, y_test_pred, average="macro"))
